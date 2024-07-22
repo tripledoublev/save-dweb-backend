@@ -187,6 +187,9 @@ impl DWebBackend {
 
     // Updated start method to initialize Veilid
     pub async fn start(&mut self) -> Result<()> {
+        if self.veilid_api.is_some() {
+            return Err(anyhow!("Veilid API is already initialized"));
+        }
         println!("Starting on {} with port {}", self.path.display(), self.port);
 
         // Ensure base directory exists
@@ -232,13 +235,15 @@ impl DWebBackend {
             anyhow!("Failed to initialize Veilid API: {}", e)
         })?);
 
+        println!("Backend started successfully.");
+
         Ok(())
     }
 
-    pub async fn stop(&self) -> Result<()> {
+    pub async fn stop(&mut self) -> Result<()> {
         println!("Stopping DWebBackend...");
-        if let Some(veilid) = &self.veilid_api {
-            veilid.clone().shutdown().await;
+        if let Some(veilid) = self.veilid_api.take() {
+            veilid.shutdown().await;
         }
         Ok(())
     }
@@ -273,51 +278,76 @@ impl DWebBackend {
 
         Ok(group)
     }
-
-    pub async fn get_group(&self, key: CryptoKey) -> Result<Box<Group>> {
+    pub async fn get_group(&mut self, key: CryptoKey) -> Result<Box<Group>> {
         if let Some(group) = self.groups.get(&key) {
             return Ok(group.clone());
         }
-
+    
         let protected_store = self.veilid_api.as_ref().unwrap().protected_store().unwrap();
         let keypair_data = protected_store.load_user_secret(key.to_string()).await
             .map_err(|_| anyhow!(FAILED_TO_LOAD_KEYPAIR))?
             .ok_or_else(|| anyhow!(KEYPAIR_NOT_FOUND))?;
-        
+    
         let retrieved_keypair: GroupKeypair = serde_cbor::from_slice(&keypair_data)
             .map_err(|_| anyhow!(FAILED_TO_DESERIALIZE_KEYPAIR))?;
-        
-        // open_dht_record function handles both cases: with and without the private key.
+    
+        println!("Loaded keypair from protected store.");
+    
         let routing_context = self.veilid_api.as_ref().unwrap().routing_context()?;
+        println!("Opened routing context.");
+    
+        // Increase wait for node initialization
+        println!("Waiting for node initialization...");
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;  // Wait for 5 seconds
+    
         let dht_record = if let Some(secret_key) = retrieved_keypair.secret_key.clone() {
-            routing_context.open_dht_record(
+            println!("Opening DHT record with private key...");
+            match routing_context.open_dht_record(
                 CryptoTyped::new(CRYPTO_KIND_VLD0, retrieved_keypair.public_key.clone()), 
                 Some(KeyPair {
                     key: retrieved_keypair.public_key.clone(),
                     secret: secret_key,
                 })
-            ).await?
+            ).await {
+                Ok(record) => record,
+                Err(e) => {
+                    println!("Failed to open DHT record with private key: {}", e);
+                    return Err(anyhow!("Failed to open DHT record with private key: {}", e));
+                }
+            }
         } else {
-            routing_context.open_dht_record(
+            println!("Opening DHT record without private key...");
+            match routing_context.open_dht_record(
                 CryptoTyped::new(CRYPTO_KIND_VLD0, retrieved_keypair.public_key.clone()), 
                 None
-            ).await?
+            ).await {
+                Ok(record) => record,
+                Err(e) => {
+                    println!("Failed to open DHT record without private key: {}", e);
+                    return Err(anyhow!("Failed to open DHT record without private key: {}", e));
+                }
+            }
         };
-
+    
+        println!("DHT record opened successfully.");
+    
         let crypto_system = CryptoSystemVLD0::new(self.veilid_api.as_ref().unwrap().crypto()?);
-
+    
         let group = Group {
             id: retrieved_keypair.public_key.clone(),
             dht_record,
             encryption_key: CryptoTyped::new(CRYPTO_KIND_VLD0, retrieved_keypair.encryption_key),
             secret_key: retrieved_keypair.secret_key.map(|sk| CryptoTyped::new(CRYPTO_KIND_VLD0, sk)),
             routing_context: Arc::new(routing_context),
-            nonce: Nonce::default(), // Replace with actual nonce initialization
+            nonce: Nonce::default(), // Ensure proper nonce initialization
             crypto_system,
         };
-
+    
+        self.groups.insert(group.get_id(), Box::new(group.clone()));
+    
         Ok(Box::new(group))
     }
+    
 
     pub async fn list_groups(&self) -> Result<Vec<Box<Group>>> {
         Ok(self.groups.values().cloned().collect())
@@ -397,38 +427,79 @@ async fn basic_test() {
     // Ensure the directory exists before creating the store
     fs::create_dir_all(path.as_ref()).await.expect("Failed to create base directory");
 
+    println!("Creating DWebBackend...");
     let mut d_web_backend = DWebBackend::new(path.as_ref(), port).expect("Unable to create DWebBackend");
 
     // Start the backend and create a group
+    println!("Starting the backend...");
     d_web_backend.start().await.expect("Unable to start");
+
+    println!("Creating a group...");
     let group = d_web_backend.create_group().await.expect("Unable to create group");
 
-    // Set and get group name
+    // Save the keys
     let group_key = group.id.clone();
+    let secret_key = group.secret_key.clone().unwrap().value;
+    let encryption_key = group.encryption_key.value.clone();
+
+    // Set and get group name
+    println!("Setting group name...");
     group.set_name(TEST_GROUP_NAME).await.expect(UNABLE_TO_SET_GROUP_NAME);
+
+    println!("Getting group name...");
     let name = group.get_name().await.expect(UNABLE_TO_GET_GROUP_NAME);
+    println!("Group name set and retrieved: {}", name);
     assert_eq!(name, TEST_GROUP_NAME);
 
+    // Close the group
+    println!("Closing the group...");
+    d_web_backend.close_group(group_key.clone()).await.expect("Unable to close group");
+
     // Stop the backend
+    println!("Stopping the backend...");
     d_web_backend.stop().await.expect("Unable to stop");
 
     // Restart the backend
+    println!("Restarting the backend...");
     d_web_backend.start().await.expect("Unable to restart");
-    // Retrieve the group using the public key
+
+    // Debug: Verify routing context initialization
+    if let Some(api) = &d_web_backend.veilid_api {
+        if let Ok(routing_context) = api.routing_context() {
+            println!("Routing context initialized successfully.");
+        } else {
+            println!("Failed to initialize routing context.");
+        }
+    } else {
+        println!("Veilid API is not initialized.");
+    }
+
+    // Retrieve the group using the saved keys
+    println!("Retrieving the group using the saved keys...");
     let loaded_group = d_web_backend.get_group(group_key.clone()).await.expect(GROUP_NOT_FOUND);
 
     // Verify the stored keypair
+    println!("Verifying the stored keypair...");
     let protected_store = d_web_backend.veilid_api.as_ref().unwrap().protected_store().unwrap();
     let keypair_data = protected_store.load_user_secret(group_key.to_string()).await.expect(FAILED_TO_LOAD_KEYPAIR).expect(KEYPAIR_NOT_FOUND);
     let retrieved_keypair: GroupKeypair = serde_cbor::from_slice(&keypair_data).expect(FAILED_TO_DESERIALIZE_KEYPAIR);
 
+    println!("Verifying the stored keypair...");
     // Verify the stored keypair
     assert_eq!(retrieved_keypair.public_key, group.id);
     assert_eq!(retrieved_keypair.secret_key, group.secret_key.as_ref().map(|sk| sk.value.clone()));
     assert_eq!(retrieved_keypair.encryption_key, group.encryption_key.value);
 
     // Verify the group can be loaded using the public key
+    println!("Verifying the group can be loaded using the public key...");
     assert_eq!(loaded_group.get_id(), retrieved_keypair.public_key);
 
+    // Verify the name is still correct after restarting the backend
+    println!("Getting the group name after restart...");
+    let loaded_name = loaded_group.get_name().await.expect(UNABLE_TO_GET_GROUP_NAME);
+    println!("Group name after restart: {}", loaded_name);
+    assert_eq!(loaded_name, TEST_GROUP_NAME);
+
+    println!("Stopping the backend...");
     d_web_backend.stop().await.expect("Unable to stop");
 }
