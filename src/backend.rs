@@ -75,15 +75,18 @@ impl Backend {
         Ok(())
     }
 
-    pub async fn stop(&self) -> Result<()> {
+    pub async fn stop(&mut self) -> Result<()> {
         println!("Stopping Backend...");
-        if let Some(veilid) = &self.veilid_api {
-            if let Ok(veilid) = Arc::try_unwrap(Arc::clone(veilid)) {
-                println!("Shutting down Veilid API");
-                veilid.shutdown().await;
-                println!("Veilid API shut down successfully");
-            } else {
-                println!("Failed to unwrap Arc. There are other references to VeilidAPI.");
+        if let Some(veilid) = self.veilid_api.take() {
+            println!("Shutting down Veilid API");
+            match Arc::try_unwrap(veilid) {
+                Ok(veilid_api) => {
+                    veilid_api.shutdown().await;
+                    println!("Veilid API shut down successfully");
+                },
+                Err(_) => {
+                    return Err(anyhow!("Failed to unwrap Arc. Other references still exist."));
+                },
             }
         }
         Ok(())
@@ -227,6 +230,7 @@ impl Backend {
             secret_key: retrieved_keypair.secret_key.map(|sk| CryptoTyped::new(CRYPTO_KIND_VLD0, sk)),
             routing_context: Arc::new(routing_context),
             crypto_system,
+            tunnels: Vec::new(),
         };
 
         Ok(Box::new(repo))

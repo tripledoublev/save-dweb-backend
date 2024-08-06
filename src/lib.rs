@@ -4,21 +4,23 @@ pub mod backend;
 pub mod common;
 pub mod constants;
 
-use crate::constants::{GROUP_NOT_FOUND, UNABLE_TO_SET_GROUP_NAME, UNABLE_TO_GET_GROUP_NAME, TEST_GROUP_NAME, UNABLE_TO_STORE_KEYPAIR, FAILED_TO_LOAD_KEYPAIR, KEYPAIR_NOT_FOUND, FAILED_TO_DESERIALIZE_KEYPAIR};
-
+use crate::constants::{GROUP_NOT_FOUND, UNABLE_TO_SET_GROUP_NAME, UNABLE_TO_GET_GROUP_NAME, TEST_GROUP_NAME, UNABLE_TO_STORE_KEYPAIR, FAILED_TO_LOAD_KEYPAIR, KEYPAIR_NOT_FOUND, FAILED_TO_DESERIALIZE_KEYPAIR, TEST_REPO_NAME, UNABLE_TO_SET_REPO_NAME, UNABLE_TO_GET_REPO_NAME};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use crate::backend::Backend;
 use crate::common::{CommonKeypair, DHTEntity};
-use veilid_core::vld0_generate_keypair;
+use veilid_core::{vld0_generate_keypair, PublicKey, Target, CryptoTyped, CRYPTO_KIND_VLD0};
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::fs;
     use tmpdir::TmpDir;
+    use std::path::PathBuf;
 
     #[tokio::test]
     async fn basic_test() {
         let path = TmpDir::new("test_dweb_backend").await.unwrap();
+        let tunnel_id_path = path.as_ref().join("tunnel_id.txt");
         let port = 8080;
 
         fs::create_dir_all(path.as_ref()).await.expect("Failed to create base directory");
@@ -57,12 +59,11 @@ mod tests {
         // Create a repo
         let repo = backend.create_repo().await.expect("Unable to create repo");
         let repo_key = repo.get_id();
-        let repo_name = "Test Repo";
 
         // Set and get repo name
-        repo.set_name(repo_name).await.expect("Unable to set repo name");
-        let name = repo.get_name().await.expect("Unable to get repo name");
-        assert_eq!(name, repo_name);
+        repo.set_name(TEST_REPO_NAME).await.expect(UNABLE_TO_SET_REPO_NAME);
+        let name = repo.get_name().await.expect(UNABLE_TO_GET_REPO_NAME);
+        assert_eq!(name, TEST_REPO_NAME);
 
         // Add repo to group
         loaded_group.add_repo(repo).await.expect("Unable to add repo to group");
@@ -72,11 +73,35 @@ mod tests {
         assert!(repos.contains(&repo_key));
   
         // Retrieve repo by key
-        let loaded_repo = backend.get_repo(repo_key.clone()).await.expect("Repo not found");
+        let mut loaded_repo = backend.get_repo(repo_key.clone()).await.expect("Repo not found");
 
         // Check if repo name is correctly retrieved
         let retrieved_name = loaded_repo.get_name().await.expect("Unable to get repo name after restart");
-        assert_eq!(retrieved_name, repo_name);
+        assert_eq!(retrieved_name, TEST_REPO_NAME);
+
+        // Retrieve tunnel ID
+        let tunnel_id = match loaded_repo.retrieve_tunnel().await {
+            Some(tunnel_id) => tunnel_id,
+            None => loaded_repo.establish_tunnel().await.expect("Unable to establish tunnel"),
+        };
+
+        // Convert the tunnel ID to PublicKey
+        let public_key = match PublicKey::try_from(BASE64_STANDARD.decode(&tunnel_id).unwrap().as_slice()) {
+            Ok(public_key) => public_key,
+            Err(e) => panic!("Failed to create public key from tunnel ID: {:?}", e),
+        };
+
+        // Create a TypedKey from the public_key
+        let typed_key = CryptoTyped::new(CRYPTO_KIND_VLD0, public_key);
+
+        // Create a target for the ping
+        let target = Target::NodeId(typed_key);
+
+        // Send a ping
+        loaded_repo.send_ping(target).await.expect("Unable to send ping");
+
+        // Remove the tunnel before closing
+        loaded_repo.remove_tunnel(&public_key).await.expect("Unable to remove tunnel");
 
         backend.stop().await.expect("Unable to stop");
     }
