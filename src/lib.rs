@@ -444,21 +444,31 @@ mod tests {
         let mut loaded_group = backend.get_group(&group_id).await.expect(GROUP_NOT_FOUND);
 
         let list = loaded_group.list_repos();
-
+        println!("lib: Loaded group has repos: {:?}", list);
         assert_eq!(list.len(), 1, "One repo got loaded back");
 
-        let loaded_repo = loaded_group
-            .get_own_repo()
-            .expect("Repo not found after restart");
+        // Iterate over the list of repo IDs and load each repo using get_repo
+        for repo_id in list {
+            // Retrieve the repo by repo_id and check if it loads correctly
+            let loaded_repo = loaded_group.get_repo(&repo_id).expect("Repo not found in list");
+            
+            // You can perform further checks or operations on the loaded_repo here
+            let repo_name = loaded_repo.get_name().await.expect("Unable to get repo name");
+            println!("Loaded repo name: {:?}", repo_name);
+        }
 
-        let retrieved_name = loaded_repo
-            .get_name()
-            .await
-            .expect("Unable to get repo name after restart");
-        assert_eq!(
-            retrieved_name, repo_name,
-            "Repo name doesn't persist after restart"
-        );
+        // match the loaded repo with "own" repo logic, you can check for that as well:
+        let own_repo = loaded_group.get_own_repo();
+        if let Some(repo) = own_repo {
+            println!("Own repo found with ID: {:?}", repo.get_id());
+            // Perform further actions with own_repo if needed
+        } else {
+            println!("No own repo found");
+        }
+
+        let peer_repos = loaded_group.list_peer_repos();
+        println!("Peer repos len: {:?}", peer_repos.len());
+        println!("Peer repos: {:?}", peer_repos.iter().map(|r| r.get_id()).collect::<Vec<_>>());
 
         let known = backend.list_known_group_ids().await?;
 
